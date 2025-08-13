@@ -10,7 +10,7 @@ from docx import Document
 HUGGINGFACE_API_TOKEN = st.secrets.get("HUGGINGFACE_API_TOKEN")
 
 # Use the specified IBM Granite instruction-tuned model
-MODEL_API_URL = "https://api-inference.huggingface.co/models/ibm-granite/granite-13b-chat-v2"
+MODEL_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
 
 # --- HELPER FUNCTIONS ---
 
@@ -173,3 +173,4 @@ with tab2:
         if response:
 
             st.session_state.messages.append({"role": "assistant", "content": response})
+
