@@ -1,177 +1,350 @@
 import streamlit as st
-import requests
-import PyPDF2
-from docx import Document
+import fitz  # PyMuPDF
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+import base64
+import os
+from datetime import datetime
+import re
 
-# --- CONFIGURATION ---
-# Fetch the API token from Streamlit's secrets management
-# For local development, this reads from .streamlit/secrets.toml
-# For deployment, this reads from the secrets set in the Streamlit Cloud dashboard
-HUGGINGFACE_API_TOKEN = st.secrets.get("HUGGINGFACE_API_TOKEN")
+# Set page configuration
+st.set_page_config(
+    page_title="StudyMate - AI-Powered PDF Q&A",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-# Use the specified IBM Granite instruction-tuned model
-MODEL_API_URL = "https://api-inference.huggingface.co/models/google/gemma-2-9b-it"
-
-# --- HELPER FUNCTIONS ---
-
-def query_huggingface_model(prompt):
-    """
-    Sends a prompt to the Hugging Face Inference API and returns the model's response.
-    """
-    if not HUGGINGFACE_API_TOKEN:
-        st.error("Hugging Face API token is not configured. Please add it to your Streamlit secrets.")
-        return None
-
-    headers = {"Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 1024, # Adjust as needed for longer responses
-            "temperature": 0.7,
-            "return_full_text": False,
-        }
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 3rem;
+        font-weight: bold;
+        text-align: center;
+        color: #2E86AB;
+        margin-bottom: 2rem;
     }
-    try:
-        response = requests.post(MODEL_API_URL, headers=headers, json=payload, timeout=120)
-        response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
-        return response.json()[0]['generated_text']
-    except requests.exceptions.RequestException as e:
-        st.error(f"API request failed: {e}")
-        return None
-    except (KeyError, IndexError) as e:
-        st.error(f"Failed to parse API response: {e} - Response: {response.text}")
-        return None
+    .upload-section {
+        background-color: #f0f2f6;
+        padding: 2rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+    }
+    .answer-card {
+        background-color: #ffffff;
+        padding: 1.5rem;
+        border-radius: 10px;
+        border-left: 5px solid #2E86AB;
+        margin: 1rem 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .question-card {
+        background-color: #e3f2fd;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 0.5rem 0;
+        border-left: 4px solid #1976d2;
+    }
+    .reference-card {
+        background-color: #f5f5f5;
+        padding: 1rem;
+        border-radius: 5px;
+        margin: 0.5rem 0;
+        font-size: 0.9rem;
+    }
+    .stButton > button {
+        background-color: #2E86AB;
+        color: white;
+        border-radius: 5px;
+        border: none;
+        padding: 0.5rem 1rem;
+        font-weight: bold;
+    }
+</style>
+""", unsafe_allow_html=True)
 
+class StudyMate:
+    def _init_(self):
+        self.embedding_model = None
+        self.llm_model = None
+        self.tokenizer = None
+        self.chunks = []
+        self.embeddings = None
+        self.faiss_index = None
+        self.chunk_metadata = []
 
-def extract_text(uploaded_file):
-    """
-    Extracts text from uploaded PDF, DOCX, or TXT files.
-    """
-    if uploaded_file.name.endswith('.pdf'):
+    @st.cache_resource
+    def load_models(_self):
+        """Load the embedding and LLM models"""
         try:
-            pdf_reader = PyPDF2.PdfReader(uploaded_file)
+            embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            # Changed from granite-3.2-2b-instruct to granite-3.1-2b-instruct
+            model_name = "ibm-granite/granite-3.1-2b-instruct"
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            llm_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None
+            )
+            return embedding_model, llm_model, tokenizer
+        except Exception as e:
+            st.error(f"Error loading models: {str(e)}")
+            return None, None, None
+
+    def extract_text_from_pdf(self, pdf_file):
+        """Extract text from uploaded PDF file"""
+        try:
+            pdf_document = fitz.open(stream=pdf_file.read(), filetype="pdf")
             text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() or ""
+            for page_num in range(len(pdf_document)):
+                page = pdf_document.load_page(page_num)
+                text += page.get_text()
+            pdf_document.close()
             return text
         except Exception as e:
-            st.error(f"Error reading PDF file: {e}")
-            return None
-    elif uploaded_file.name.endswith('.docx'):
+            st.error(f"Error extracting text from {pdf_file.name}: {str(e)}")
+            return ""
+
+    def chunk_text(self, text, filename, chunk_size=500, overlap=100):
+        """Split text into overlapping chunks"""
+        words = text.split()
+        chunks = []
+        metadata = []
+        if len(words) <= chunk_size:
+            chunks.append(text)
+            metadata.append({"filename": filename, "chunk_id": 0})
+            return chunks, metadata
+
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk_words = words[i:i + chunk_size]
+            chunk_text = ' '.join(chunk_words)
+            chunks.append(chunk_text)
+            metadata.append({"filename": filename, "chunk_id": len(chunks) - 1})
+            if i + chunk_size >= len(words):
+                break
+        return chunks, metadata
+
+    def process_pdfs(self, uploaded_files):
+        """Process uploaded PDF files"""
+        if not uploaded_files:
+            return False
+
+        self.chunks = []
+        self.chunk_metadata = []
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        for idx, pdf_file in enumerate(uploaded_files):
+            status_text.text(f"Processing {pdf_file.name}...")
+            text = self.extract_text_from_pdf(pdf_file)
+            if not text.strip():
+                st.warning(f"No text found in {pdf_file.name}")
+                continue
+            file_chunks, file_metadata = self.chunk_text(text, pdf_file.name)
+            self.chunks.extend(file_chunks)
+            self.chunk_metadata.extend(file_metadata)
+            progress_bar.progress((idx + 1) / len(uploaded_files))
+
+        status_text.text("Creating embeddings...")
+        if self.chunks:
+            try:
+                self.embeddings = self.embedding_model.encode(self.chunks, show_progress_bar=True)
+                dimension = self.embeddings.shape[1]
+                self.faiss_index = faiss.IndexFlatL2(dimension)
+                self.faiss_index.add(self.embeddings.astype('float32'))
+                progress_bar.progress(1.0)
+                status_text.text(f"✅ Successfully processed {len(uploaded_files)} PDF(s) with {len(self.chunks)} chunks")
+                return True
+            except Exception as e:
+                st.error(f"Error creating embeddings: {str(e)}")
+                return False
+        return False
+
+    def retrieve_relevant_chunks(self, query, k=3):
+        """Retrieve most relevant chunks for the query"""
+        if not self.faiss_index or not self.chunks:
+            return []
         try:
-            doc = Document(uploaded_file)
-            return "\n".join([para.text for para in doc.paragraphs])
+            query_embedding = self.embedding_model.encode([query])
+            scores, indices = self.faiss_index.search(query_embedding.astype('float32'), k)
+            relevant_chunks = []
+            for i, idx in enumerate(indices[0]):
+                if idx < len(self.chunks):
+                    relevant_chunks.append({
+                        'text': self.chunks[idx],
+                        'metadata': self.chunk_metadata[idx],
+                        'score': scores[0][i]
+                    })
+            return relevant_chunks
         except Exception as e:
-            st.error(f"Error reading DOCX file: {e}")
-            return None
-    elif uploaded_file.name.endswith('.txt'):
+            st.error(f"Error retrieving chunks: {str(e)}")
+            return []
+
+    def generate_answer(self, query, relevant_chunks):
+        """Generate answer using the Granite 3.1 model with attention mask fix"""
+        if not relevant_chunks:
+            return "I couldn't find relevant information in the uploaded documents to answer your question."
+
+        context = "\n\n".join([chunk['text'] for chunk in relevant_chunks[:3]])
+
+        prompt = f"""Based on the following context from academic documents, please provide a clear and accurate answer to the question. Only use information from the provided context.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
+
         try:
-            return uploaded_file.getvalue().decode("utf-8")
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=1500,
+                padding="max_length"
+            )
+            attention_mask = inputs["attention_mask"]
+
+            with torch.no_grad():
+                outputs = self.llm_model.generate(
+                    inputs.input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=300,
+                    temperature=0.7,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.pad_token_id
+                )
+
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            answer = response.split("Answer:")[-1].strip()
+            return answer
+
         except Exception as e:
-            st.error(f"Error reading TXT file: {e}")
-            return None
-    return None
+            return f"Error generating answer: {str(e)}"
 
-# --- STREAMLIT APP LAYOUT ---
+def main():
+    st.markdown('<h1 class="main-header">📚 StudyMate</h1>', unsafe_allow_html=True)
+    st.markdown('<p style="text-align: center; font-size: 1.2rem; color: #666;">AI-Powered PDF-Based Q&A System for Students</p>', unsafe_allow_html=True)
 
-st.set_page_config(page_title="ClauseWise Legal Analyzer", layout="wide", initial_sidebar_state="collapsed")
+    if 'studymate' not in st.session_state:
+        st.session_state.studymate = StudyMate()
+    if 'qa_history' not in st.session_state:
+        st.session_state.qa_history = []
 
-st.title("ClauseWise: AI Legal Document Analyzer ⚖️")
-st.markdown("Simplify, decode, and classify complex legal texts using IBM's Granite AI model.")
+    studymate = st.session_state.studymate
 
-# --- Main Tabs ---
-tab1, tab2 = st.tabs(["📄 Document Analyzer", "💬 Legal Q&A Chatbot"])
+    if studymate.embedding_model is None:
+        with st.spinner("Loading AI models... This may take a few moments."):
+            studymate.embedding_model, studymate.llm_model, studymate.tokenizer = studymate.load_models()
+        if studymate.embedding_model is None:
+            st.error("Failed to load models. Please check your internet connection and try again.")
+            return
 
+    st.markdown('<div class="upload-section">', unsafe_allow_html=True)
+    st.markdown("### 📁 Upload Your Study Materials")
 
-# --- TAB 1: DOCUMENT ANALYZER ---
-with tab1:
-    st.header("Upload and Analyze Your Legal Document")
-    st.markdown("Supports **PDF, DOCX, and TXT** formats. The model will classify the document, simplify its clauses, identify risks, and extract key entities.")
+    uploaded_files = st.file_uploader(
+        "Choose PDF files",
+        type=['pdf'],
+        accept_multiple_files=True,
+        help="Upload one or more PDF files containing your study materials"
+    )
 
-    uploaded_file = st.file_uploader("Choose a document", type=["pdf", "docx", "txt"])
-
-    if uploaded_file is not None:
-        if st.button("Analyze Document", key="analyze_doc"):
-            with st.spinner("Reading and analyzing the document... This may take a moment."):
-                # 1. Extract text from the document
-                document_text = extract_text(uploaded_file)
-
-                if document_text:
-                    st.success("Document text extracted successfully!")
-
-                    # 2. Define prompts for different analysis tasks
-                    prompt_classify = f"Based on the content of the following legal document, what is the most likely document type? Examples: Non-Disclosure Agreement, Employment Contract, Lease Agreement, Service Agreement. Provide only the document type.\n\nDocument:\n{document_text[:4000]}\n\nDocument Type:"
-                    prompt_simplify = f"Rewrite the following legal clauses in simple, plain English that a non-lawyer can easily understand. Break it down clause by clause.\n\nDocument:\n{document_text}\n\nSimplified Clauses:"
-                    prompt_risk = f"Analyze the following legal text and identify potential risks, liabilities, and unfavorable clauses for a party signing this document. Present the analysis in a clear, structured format with bullet points.\n\nDocument:\n{document_text}\n\nRisk Analysis:"
-                    prompt_ner = f"From the following legal text, extract the key entities. List them under these specific categories: Parties (names of people or companies involved), Obligations (key duties or actions required), Key Dates (specific dates or deadlines mentioned), and Governing Law (the jurisdiction mentioned).\n\nDocument:\n{document_text}\n\nExtracted Entities:"
-
-                    # 3. Query the model for each task
-                    doc_type = query_huggingface_model(prompt_classify)
-                    simplified_text = query_huggingface_model(prompt_simplify)
-                    risk_analysis = query_huggingface_model(prompt_risk)
-                    entities = query_huggingface_model(prompt_ner)
-
-                    # 4. Display results
-                    st.subheader(f"Analysis Results for: `{uploaded_file.name}`")
-
-                    if doc_type:
-                        st.info(f"**Predicted Document Type:** {doc_type.strip()}")
-
-                    if simplified_text:
-                        with st.expander("🔍 Simplified Clauses (Plain English Version)", expanded=True):
-                            st.markdown(simplified_text)
-
-                    if risk_analysis:
-                        with st.expander("⚠️ Risk Analysis", expanded=True):
-                            st.markdown(risk_analysis)
-
-                    if entities:
-                        with st.expander("📌 Key Entities Extracted", expanded=True):
-                            st.markdown(entities)
+    if uploaded_files:
+        if st.button("🔄 Process PDFs"):
+            with st.spinner("Processing your documents..."):
+                success = studymate.process_pdfs(uploaded_files)
+                if success:
+                    st.success(f"✅ Successfully processed {len(uploaded_files)} PDF(s)!")
                 else:
-                    st.error("Could not extract text from the document. The file might be corrupted, empty, or an image-based PDF.")
+                    st.error("❌ Failed to process PDFs. Please try again.")
 
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# --- TAB 2: LEGAL Q&A CHATBOT ---
-with tab2:
-    st.header("Ask a General Legal Question")
-    st.markdown("Get general information about **criminal law, traffic law, and human rights**. This chatbot does not provide legal advice.")
-    
-    # Disclaimer
-    st.warning("🚨 **Disclaimer:** I am an AI assistant, not a lawyer. The information provided here is for general informational purposes only and does not constitute legal advice. Always consult with a qualified legal professional for advice on your specific situation.")
+    if studymate.chunks:
+        st.markdown("### 💭 Ask Your Question")
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            user_question = st.text_input(
+                "Enter your question about the uploaded documents:",
+                placeholder="e.g., What is machine learning? Explain classification vs regression.",
+                key="question_input"
+            )
+        with col2:
+            ask_button = st.button("🔍 Ask", type="primary")
 
-    # Initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+        if ask_button and user_question.strip():
+            with st.spinner("Searching for relevant information and generating answer..."):
+                relevant_chunks = studymate.retrieve_relevant_chunks(user_question)
+                if relevant_chunks:
+                    answer = studymate.generate_answer(user_question, relevant_chunks)
+                    st.session_state.qa_history.append({
+                        'question': user_question,
+                        'answer': answer,
+                        'chunks': relevant_chunks,
+                        'timestamp': datetime.now().strftime("%H:%M:%S")
+                    })
 
-    # Display chat messages from history
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+                    st.markdown('<div class="answer-card">', unsafe_allow_html=True)
+                    st.markdown("*Answer:*")
+                    st.markdown(answer)
+                    st.markdown('</div>', unsafe_allow_html=True)
 
-    # React to user input
-    if prompt := st.chat_input("Ask a question about criminal, traffic, or human rights law..."):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        # Display user message in chat message container
-        with st.chat_message("user"):
-            st.markdown(prompt)
+                    with st.expander("📖 Referenced Paragraphs"):
+                        for i, chunk in enumerate(relevant_chunks):
+                            st.markdown(f"*Source: {chunk['metadata']['filename']} (Chunk {chunk['metadata']['chunk_id']})*")
+                            st.markdown(f'<div class="reference-card">{chunk["text"]}</div>', unsafe_allow_html=True)
+                else:
+                    st.warning("No relevant information found in the uploaded documents.")
 
-        # Generate and display assistant response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                chatbot_prompt = f"""You are a helpful legal AI assistant named ClauseWise. Your purpose is to provide general information about criminal, traffic, and human rights law in simple terms. You must not give legal advice. You must include a brief disclaimer at the end of every response stating that the user should consult with a qualified legal professional.
+    if st.session_state.qa_history:
+        st.markdown("### 📝 Q&A History")
+        if st.button("📥 Download Q&A History"):
+            history_text = f"StudyMate Q&A Session - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            history_text += "=" * 50 + "\n\n"
+            for i, qa in enumerate(st.session_state.qa_history, 1):
+                history_text += f"Q{i} ({qa['timestamp']}): {qa['question']}\n"
+                history_text += f"A{i}: {qa['answer']}\n"
+                history_text += "-" * 30 + "\n\n"
 
-                User question: {prompt}
+            st.download_button(
+                label="📄 Download as Text File",
+                data=history_text,
+                file_name=f"studymate_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain"
+            )
 
-                Answer:"""
-                
-                response = query_huggingface_model(chatbot_prompt)
-                st.markdown(response or "Sorry, I couldn't process that request.")
-        
-        # Add assistant response to chat history
-        if response:
+        for i, qa in enumerate(reversed(st.session_state.qa_history)):
+            with st.container():
+                st.markdown(f'<div class="question-card"><strong>Q:</strong> {qa["question"]} <small>({qa["timestamp"]})</small></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="answer-card"><strong>A:</strong> {qa["answer"]}</div>', unsafe_allow_html=True)
 
-            st.session_state.messages.append({"role": "assistant", "content": response})
+    if not studymate.chunks:
+        st.markdown("### 🚀 How to Use StudyMate")
+        st.markdown("""
+        1. *Upload PDFs*: Use the file uploader above to upload your study materials (textbooks, notes, papers)
+        2. *Process Documents*: Click 'Process PDFs' to prepare your documents for Q&A
+        3. *Ask Questions*: Type your questions in natural language
+        4. *Get Answers*: Receive AI-generated answers with source references
+        5. *Download History*: Save your Q&A session for future reference
 
+        *Example Questions:*
+        - What is overfitting in machine learning?
+        - Explain the difference between classification and regression
+        - What are the key principles of data preprocessing?
+        - How does cross-validation work?
+        """)
 
+    st.markdown("---")
+    st.markdown("Made with ❤ using Streamlit, Sentence Transformers, FAISS, and Hugging Face Transformers")
+
+if _name_ == "_main_":
+    main()
