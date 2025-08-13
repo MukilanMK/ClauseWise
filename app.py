@@ -82,7 +82,7 @@ class StudyMate:
         try:
             embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
             # Changed from granite-3.2-2b-instruct to granite-3.1-2b-instruct
-            model_name = "ibm-granite/granite-3.1-2b-instruct"
+            model_name ="ibm-granite/granite-3.2-2b-instruct"
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             llm_model = AutoModelForCausalLM.from_pretrained(
                 model_name,
@@ -348,3 +348,4 @@ def main():
 
 if _name_ == "_main_":
     main()
+
